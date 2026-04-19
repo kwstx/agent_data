@@ -6,9 +6,9 @@ We are building a Verifiable Real-Time Data & State Access Layer for Autonomous 
 ## Core Principles (Phase 1)
 - **Minimal, Production-Grade Core**: Focus on sub-second data freshness, cryptographic verifiability, and a unified agent interface.
 - **Hybrid Push-Pull Architecture**: 
-    - **Push**: Continuous streaming of high-frequency data (e.g., asset prices, on-chain events) via heartbeat or deviation triggers.
+    - **Push**: Continuous streaming of high-frequency data via heartbeat or deviation triggers.
     - **Pull**: On-demand queries returning the latest verified snapshots.
-- **Primary Goal**: Establish a fast, reliable, and verifiable data pipeline to prevent agent hallucinations and stale state.
+- **Protocol Evolution (Phase 3)**: Establish a decentralized, permissionless global state layer with multi-data type support and cross-chain verification.
 
 ## System Architecture
 
@@ -17,8 +17,8 @@ The system is constructed as a real-time data pipeline composed of three tightly
 1.  **Off-chain Ingestion & Processing Layer**: Handles continuous streaming of external and on-chain data into independent nodes. Assets and events are normalized in near real-time.
 2.  **Cryptographically Verifiable Aggregation Layer**: 
     - **Quorum Mechanism**: Observations are signed by independent nodes (Ed25519) and aggregated once a majority is reached.
-    - **Deterministic Aggregation**: Outlier-resistant functions (e.g., median) reconcile conflicting values from different sources/nodes.
-    - **Merkle Accountability**: Aggregated states are hashed into Merkle trees, enabling compact proofs and verifiable audit trails for every state update.
+    - **Deterministic & Generalized Aggregation**: Supports heterogeneous data (numbers via median, objects/strings via mode consensus).
+    - **Merkle Accountability**: Aggregated states are hashed into Merkle trees, enabling compact proofs and cross-chain verification.
 3
 1.  **Unified State Access Layer**: Exposed to autonomous agents, providing a seamless interface for both push-based event streams and pull-based state queries.
 2.  **On-Chain Verification Anchor**: 
@@ -110,6 +110,7 @@ In order to deploy the system, we implement a phased rollout designed to validat
 2.  **Phase 2: Multi-Node Quorum & On-Chain Enforcement**:
     - Focus: Extending to a distributed multi-node quorum architecture.
     - Goal: Implement on-chain verification enforcement where state updates must be backed by cryptographic proofs of majority agreement.
-3.  **Phase 3: Decentralized Verification Network**:
-    - Focus: Introduction of staking, slashing, and permissionless participation.
-    - Goal: Transform the system into a fully decentralized network capable of supporting heterogeneous data types and cross-chain environments with robust economic security.
+3.  **Phase 3: Decentralized Protocol Network (Active)**:
+    - **Focus**: Introduction of staking, slashing, and **permissionless participation**.
+    - **Generalized State**: Support for arbitrary JSON schemas, moving beyond simple price feeds to complex state transitions.
+    - **Cross-Chain Commitments**: Implementation of cryptographic state commitments for query-verify-act loops across heterogeneous environments.

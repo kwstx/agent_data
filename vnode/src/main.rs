@@ -18,6 +18,7 @@ use axum::{
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use serde::{Serialize, Deserialize};
+use serde_json;
 use dashmap::DashMap;
 
 mod economics;
@@ -44,7 +45,7 @@ impl Hasher for Sha256Hasher {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateValue {
-    pub value: f64,
+    pub value: serde_json::Value,
     pub timestamp: DateTime<Utc>,
     pub source: String,
 }
@@ -53,7 +54,7 @@ pub struct StateValue {
 pub struct SignedObservation {
     pub node_id: String,
     pub key: String,
-    pub value: f64,
+    pub value: serde_json::Value,
     pub timestamp: DateTime<Utc>,
     pub signature: String,
     pub public_key: String,
@@ -63,8 +64,8 @@ pub struct SignedObservation {
 pub struct QuorumSnapshot {
     pub epoch: u64,
     pub merkle_root: String,
-    pub values: BTreeMap<String, f64>, // Aggregated values (e.g. medians)
-    pub signatures: Vec<String>,      // Evidence of node agreement
+    pub values: BTreeMap<String, serde_json::Value>, // Aggregated values (e.g. medians or modes)
+    pub signatures: Vec<String>,                    // Evidence of node agreement
     pub slashing_events: Vec<SlashingEvent>,
 }
 
@@ -80,7 +81,7 @@ pub type GlobalState = Arc<DashMap<String, StateValue>>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResponse {
     pub key: String,
-    pub value: f64,
+    pub value: serde_json::Value,
     pub proof: ProofData,
 }
 
@@ -102,7 +103,7 @@ pub struct InternalSnapshot {
 #[async_trait]
 pub trait DataSource: Send + Sync {
     fn name(&self) -> String;
-    async fn fetch_update(&self) -> Result<Vec<(String, f64)>>;
+    async fn fetch_update(&self) -> Result<Vec<(String, serde_json::Value)>>;
 }
 
 // --- Mock Sources ---
@@ -114,9 +115,9 @@ pub struct ExchangeApi {
 #[async_trait]
 impl DataSource for ExchangeApi {
     fn name(&self) -> String { self.name.clone() }
-    async fn fetch_update(&self) -> Result<Vec<(String, f64)>> {
+    async fn fetch_update(&self) -> Result<Vec<(String, serde_json::Value)>> {
         let val = 2500.0 + (rand::random::<f64>() * 50.0);
-        Ok(vec![("ETH/USD".to_string(), val)])
+        Ok(vec![("ETH/USD".to_string(), serde_json::json!(val))])
     }
 }
 
@@ -185,39 +186,68 @@ impl IngestionNode {
     }
 
     /// Signs an observation for a given key and value
-    fn sign_observation(&self, key: &str, value: f64) -> SignedObservation {
+    fn sign_observation(&self, key: &str, value: &serde_json::Value) -> SignedObservation {
         let timestamp = Utc::now();
-        let message = format!("{}:{}:{}:{}", self.id, key, value, timestamp.to_rfc3339());
+        let val_str = serde_json::to_string(value).unwrap_or_default();
+        let message = format!("{}:{}:{}:{}", self.id, key, val_str, timestamp.to_rfc3339());
         let signature = self.signing_key.sign(message.as_bytes());
         
         SignedObservation {
             node_id: self.id.clone(),
             key: key.to_string(),
-            value,
+            value: value.clone(),
             timestamp,
             signature: hex::encode(signature.to_bytes()),
             public_key: hex::encode(VerifyingKey::from(&self.signing_key).to_bytes()),
         }
     }
 
-    /// Deterministic aggregation: calculates median of a list of values
-    fn calculate_median(values: &mut Vec<f64>) -> f64 {
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let mid = values.len() / 2;
-        if values.len() % 2 == 0 {
-            (values[mid - 1] + values[mid]) / 2.0
+    /// Generalized aggregation: calculates median for numbers, mode for others
+    fn aggregate_values(values: &[serde_json::Value]) -> serde_json::Value {
+        if values.is_empty() { return serde_json::Value::Null; }
+
+        // Check if all are numbers
+        let mut numbers = Vec::new();
+        for v in values {
+            if let Some(n) = v.as_f64() {
+                numbers.push(n);
+            }
+        }
+
+        if numbers.len() == values.len() {
+            // All numbers: calculate median
+            numbers.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mid = numbers.len() / 2;
+            let result = if numbers.len() % 2 == 0 {
+                (numbers[mid - 1] + numbers[mid]) / 2.0
+            } else {
+                numbers[mid]
+            };
+            serde_json::json!(result)
         } else {
-            values[mid]
+            // Mixed or non-numbers: calculate mode
+            let mut counts = BTreeMap::new();
+            for v in values {
+                let serialized = serde_json::to_string(v).unwrap();
+                *counts.entry(serialized).or_insert(0) += 1;
+            }
+            let mode_serialized = counts.into_iter()
+                .max_by_key(|&(_, count)| count)
+                .map(|(val, _)| val)
+                .unwrap();
+            
+            serde_json::from_str(&mode_serialized).unwrap()
         }
     }
 
     /// Performs Merkle tree construction over aggregated state
-    fn build_merkle_tree(values: &BTreeMap<String, f64>) -> (MerkleTree<Sha256Hasher>, BTreeMap<String, usize>) {
+    fn build_merkle_tree(values: &BTreeMap<String, serde_json::Value>) -> (MerkleTree<Sha256Hasher>, BTreeMap<String, usize>) {
         let mut key_to_index = BTreeMap::new();
         let leaves: Vec<[u8; 32]> = values.iter().enumerate()
             .map(|(i, (k, v))| {
                 key_to_index.insert(k.clone(), i);
-                let leaf_data = format!("{}:{}", k, v);
+                let val_str = serde_json::to_string(v).unwrap_or_default();
+                let leaf_data = format!("{}:{}", k, val_str);
                 Sha256Hasher::hash(leaf_data.as_bytes())
             })
             .collect();
@@ -240,25 +270,24 @@ impl IngestionNode {
             // 1. Collect local observations and sign them
             let mut local_observations = Vec::new();
             for entry in self.state.iter() {
-                let obs = self.sign_observation(entry.key(), entry.value().value);
+                let obs = self.sign_observation(entry.key(), &entry.value().value);
                 local_observations.push(obs);
             }
 
-            // 2. Simulate receiving peer observations (Mocking 2 other nodes)
+            // 2. Simulate receiving peer observations from registered nodes
             let mut all_observations = local_observations.clone();
-            all_observations.extend(self.simulate_peer_data());
+            all_observations.extend(self.simulate_registered_peer_data().await);
 
-            // 3. Deterministic Aggregation (Median)
-            let mut value_map: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+            // 3. Generalized Aggregation
+            let mut value_map: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
             for obs in &all_observations {
-                value_map.entry(obs.key.clone()).or_default().push(obs.value);
+                value_map.entry(obs.key.clone()).or_default().push(obs.value.clone());
             }
 
             let mut aggregated_values = BTreeMap::new();
             for (key, values) in &value_map {
-                let mut v = values.clone();
-                let median = Self::calculate_median(&mut v);
-                aggregated_values.insert(key.clone(), median);
+                let consensus_value = Self::aggregate_values(values);
+                aggregated_values.insert(key.clone(), consensus_value);
             }
 
             // 4. Construct Merkle Tree over aggregated state
@@ -270,26 +299,45 @@ impl IngestionNode {
             let mut slashing_events = Vec::new();
 
             if current_phase != DeploymentPhase::SingleChain {
-                for (node_id, _values) in &value_map {
-                    // If we have a consensus value (median) for this key
-                    if let Some(&median) = aggregated_values.get(node_id) {
+                for (key, consensus_val) in &aggregated_values {
+                    // Only perform deviation slashing if it's a number
+                    if let Some(median) = consensus_val.as_f64() {
                         for obs in &all_observations {
-                            if &obs.key == node_id {
-                                let deviation = (obs.value - median).abs() / median;
-                                let is_consistent = deviation < self.staking_manager.slashing_threshold;
-                                
+                            if &obs.key == key {
+                                if let Some(obs_val) = obs.value.as_f64() {
+                                    let deviation = (obs_val - median).abs() / median;
+                                    let is_consistent = deviation < self.staking_manager.slashing_threshold;
+                                    
+                                    self.staking_manager.update_performance(&obs.node_id, is_consistent, 0).await;
+                                    
+                                    if !is_consistent && current_phase == DeploymentPhase::FullyDecentralized {
+                                        if let Some(event) = self.staking_manager.slash_node(
+                                            &obs.node_id, 
+                                            epoch, 
+                                            &format!("Value deviation: {:.2}%", deviation * 100.0),
+                                            0.05
+                                        ).await {
+                                            slashing_events.push(event);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // For non-numbers (strings/bools), check for exact match
+                        for obs in &all_observations {
+                            if &obs.key == key {
+                                let is_consistent = &obs.value == consensus_val;
                                 self.staking_manager.update_performance(&obs.node_id, is_consistent, 0).await;
                                 
-                                // Slashing is only active in Phase 3
                                 if !is_consistent && current_phase == DeploymentPhase::FullyDecentralized {
                                     if let Some(event) = self.staking_manager.slash_node(
                                         &obs.node_id, 
                                         epoch, 
-                                        &format!("Value deviation: {:.2}%", deviation * 100.0),
-                                        0.05 // Slash 5% for malicious/incorrect data
+                                        "Value mismatch (mode consensus)",
+                                        0.05
                                     ).await {
                                         slashing_events.push(event);
-                                        log::warn!("Node {} SLASHED for deviation: {:.2}%", obs.node_id, deviation * 100.0);
                                     }
                                 }
                             }
@@ -311,11 +359,15 @@ impl IngestionNode {
 
             let mut all_signatures = vec![node_signature];
             
-            // In Phase 1, we might only have one signature. 
             // In Phase 2+, we require collective signatures.
             if current_phase != DeploymentPhase::SingleChain {
-                all_signatures.push("peer_alpha_sig_placeholder".to_string());
-                all_signatures.push("peer_beta_sig_placeholder".to_string());
+                let nodes = self.staking_manager.nodes.read().await;
+                for (id, _stats) in nodes.iter() {
+                    if id != &self.id {
+                        // Mocking signature from registered node
+                        all_signatures.push(format!("{}_sig_placeholder", id));
+                    }
+                }
             }
 
             let snapshot = QuorumSnapshot {
@@ -344,26 +396,27 @@ impl IngestionNode {
         }
     }
 
-    fn simulate_peer_data(&self) -> Vec<SignedObservation> {
-        // Mocking peer nodes providing slightly different data
+    async fn simulate_registered_peer_data(&self) -> Vec<SignedObservation> {
         let mut peers = Vec::new();
-        let peer_ids = vec!["node_beta", "node_gamma"];
+        let nodes = self.staking_manager.nodes.read().await;
         
-        for (_i, pid) in peer_ids.iter().enumerate() {
+        for (id, _stats) in nodes.iter() {
+            if id == &self.id { continue; }
+            
             let mut offset = (rand::random::<f64>() - 0.5) * 10.0;
             
             // Periodically inject "malicious" or "stale" data from node_gamma to demonstrate slashing
-            if *pid == "node_gamma" && rand::random::<f64>() < 0.2 {
+            if id == "node_gamma" && rand::random::<f64>() < 0.2 {
                 offset = 100.0; // Significant deviation
             }
 
             peers.push(SignedObservation {
-                node_id: pid.to_string(),
+                node_id: id.clone(),
                 key: "ETH/USD".to_string(),
-                value: 2500.0 + offset, 
+                value: serde_json::json!(2500.0 + offset), 
                 timestamp: Utc::now(),
-                signature: "peer_sig_placeholder".to_string(),
-                public_key: "peer_pk_placeholder".to_string(),
+                signature: format!("{}_sig", id),
+                public_key: format!("{}_pk", id),
             });
         }
         peers
@@ -401,7 +454,9 @@ async fn main() -> Result<()> {
         .route("/state", get(get_all_state))
         .route("/state/:key", get(get_key_state))
         .route("/nodes", get(get_nodes))
+        .route("/nodes/join", axum::routing::post(onboard_node))
         .route("/economics", get(get_economics))
+        .route("/verify/proof", axum::routing::post(verify_proof))
         .route("/simulation/chaos", axum::routing::post(set_chaos))
         .route("/simulation/load", axum::routing::post(run_load))
         .route("/simulation/phase", axum::routing::post(set_phase))
@@ -512,6 +567,64 @@ async fn get_economics(State(node): State<Arc<IngestionNode>>) -> impl IntoRespo
     let nodes = node.staking_manager.nodes.read().await;
     let stats: Vec<NodeStats> = nodes.values().cloned().collect();
     Json(stats).into_response()
+}
+
+#[derive(Deserialize)]
+struct OnboardRequest {
+    node_id: String,
+    stake: f64,
+}
+
+async fn onboard_node(
+    State(node): State<Arc<IngestionNode>>,
+    Json(payload): Json<OnboardRequest>,
+) -> impl IntoResponse {
+    match node.staking_manager.register_node(&payload.node_id, payload.stake).await {
+        Ok(_) => {
+            log::info!("Permissionless Onboarding: Node {} joined with stake {}", payload.node_id, payload.stake);
+            (axum::http::StatusCode::OK, "Node joined").into_response()
+        },
+        Err(e) => (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct VerifyRequest {
+    key: String,
+    value: serde_json::Value,
+    root: String,
+    proof_path: Vec<(String, bool)>,
+}
+
+async fn verify_proof(
+    Json(payload): Json<VerifyRequest>,
+) -> impl IntoResponse {
+    // Reconstruct the leaf
+    let val_str = serde_json::to_string(&payload.value).unwrap_or_default();
+    let leaf_data = format!("{}:{}", payload.key, val_str);
+    let mut current_hash = Sha256Hasher::hash(leaf_data.as_bytes());
+
+    for (hash_hex, is_left) in payload.proof_path {
+        let sibling = hex::decode(hash_hex).unwrap();
+        let mut hasher = Sha256::new();
+        if is_left {
+            hasher.update(&sibling);
+            hasher.update(&current_hash);
+        } else {
+            hasher.update(&current_hash);
+            hasher.update(&sibling);
+        }
+        current_hash = hasher.finalize().into();
+    }
+
+    let calculated_root = hex::encode(current_hash);
+    let is_valid = calculated_root == payload.root;
+
+    Json(serde_json::json!({
+        "valid": is_valid,
+        "calculated_root": calculated_root,
+        "provided_root": payload.root
+    })).into_response()
 }
 
 #[derive(Deserialize)]
