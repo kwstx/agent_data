@@ -17,6 +17,8 @@ use axum::{
 };
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
+use serde::{Serialize, Deserialize};
+use dashmap::DashMap;
 
 mod economics;
 mod simulation;
@@ -64,6 +66,13 @@ pub struct QuorumSnapshot {
     pub values: BTreeMap<String, f64>, // Aggregated values (e.g. medians)
     pub signatures: Vec<String>,      // Evidence of node agreement
     pub slashing_events: Vec<SlashingEvent>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum DeploymentPhase {
+    SingleChain,        // Phase 1: Semi-trusted cluster, basic aggregation
+    MultiNodeQuorum,    // Phase 2: Quorum enforcement, on-chain verification focus
+    FullyDecentralized, // Phase 3: Staking, slashing, permissionless
 }
 
 pub type GlobalState = Arc<DashMap<String, StateValue>>;
@@ -125,6 +134,7 @@ struct IngestionNode {
     tx: broadcast::Sender<QuorumSnapshot>,
     pub staking_manager: Arc<StakingManager>,
     pub chaos: Arc<ChaosGovernor>,
+    pub phase: Arc<tokio::sync::RwLock<DeploymentPhase>>,
 }
 
 impl IngestionNode {
@@ -144,6 +154,7 @@ impl IngestionNode {
             tx,
             staking_manager: Arc::new(StakingManager::new(100.0)),
             chaos: Arc::new(ChaosGovernor::new()),
+            phase: Arc::new(tokio::sync::RwLock::new(DeploymentPhase::SingleChain)), // Start at Phase 1
         }
     }
 
@@ -254,27 +265,32 @@ impl IngestionNode {
             let (tree, key_to_index) = Self::build_merkle_tree(&aggregated_values);
             let root = hex::encode(tree.root().unwrap_or([0u8; 32]));
 
-            // 5. Evaluate Node Performance and Check for Slashing
+            // 5. Evaluate Node Performance and Check for Slashing (Only in Phase 2/3)
+            let current_phase = *self.phase.read().await;
             let mut slashing_events = Vec::new();
-            for (node_id, _values) in &value_map {
-                // If we have a consensus value (median) for this key
-                if let Some(&median) = aggregated_values.get(node_id) {
-                    for obs in &all_observations {
-                        if &obs.key == node_id {
-                            let deviation = (obs.value - median).abs() / median;
-                            let is_consistent = deviation < self.staking_manager.slashing_threshold;
-                            
-                            self.staking_manager.update_performance(&obs.node_id, is_consistent, 0).await;
-                            
-                            if !is_consistent {
-                                if let Some(event) = self.staking_manager.slash_node(
-                                    &obs.node_id, 
-                                    epoch, 
-                                    &format!("Value deviation: {:.2}%", deviation * 100.0),
-                                    0.05 // Slash 5% for malicious/incorrect data
-                                ).await {
-                                    slashing_events.push(event);
-                                    log::warn!("Node {} SLASHED for deviation: {:.2}%", obs.node_id, deviation * 100.0);
+
+            if current_phase != DeploymentPhase::SingleChain {
+                for (node_id, _values) in &value_map {
+                    // If we have a consensus value (median) for this key
+                    if let Some(&median) = aggregated_values.get(node_id) {
+                        for obs in &all_observations {
+                            if &obs.key == node_id {
+                                let deviation = (obs.value - median).abs() / median;
+                                let is_consistent = deviation < self.staking_manager.slashing_threshold;
+                                
+                                self.staking_manager.update_performance(&obs.node_id, is_consistent, 0).await;
+                                
+                                // Slashing is only active in Phase 3
+                                if !is_consistent && current_phase == DeploymentPhase::FullyDecentralized {
+                                    if let Some(event) = self.staking_manager.slash_node(
+                                        &obs.node_id, 
+                                        epoch, 
+                                        &format!("Value deviation: {:.2}%", deviation * 100.0),
+                                        0.05 // Slash 5% for malicious/incorrect data
+                                    ).await {
+                                        slashing_events.push(event);
+                                        log::warn!("Node {} SLASHED for deviation: {:.2}%", obs.node_id, deviation * 100.0);
+                                    }
                                 }
                             }
                         }
@@ -282,9 +298,11 @@ impl IngestionNode {
                 }
             }
 
-            // 6. Distribute Rewards
-            let rewards = self.staking_manager.calculate_rewards(1.0).await; // 1.0 units per epoch
-            self.staking_manager.distribute_rewards(rewards).await;
+            // 6. Distribute Rewards (Only in Phase 3)
+            if current_phase == DeploymentPhase::FullyDecentralized {
+                let rewards = self.staking_manager.calculate_rewards(1.0).await;
+                self.staking_manager.distribute_rewards(rewards).await;
+            }
 
             // 7. Produce Quorum Snapshot
             let message = format!("epoch:{}:root:{}", epoch, root);
@@ -292,8 +310,13 @@ impl IngestionNode {
             let node_signature = hex::encode(signature.to_bytes());
 
             let mut all_signatures = vec![node_signature];
-            all_signatures.push("peer_alpha_sig_placeholder".to_string());
-            all_signatures.push("peer_beta_sig_placeholder".to_string());
+            
+            // In Phase 1, we might only have one signature. 
+            // In Phase 2+, we require collective signatures.
+            if current_phase != DeploymentPhase::SingleChain {
+                all_signatures.push("peer_alpha_sig_placeholder".to_string());
+                all_signatures.push("peer_beta_sig_placeholder".to_string());
+            }
 
             let snapshot = QuorumSnapshot {
                 epoch,
@@ -381,6 +404,7 @@ async fn main() -> Result<()> {
         .route("/economics", get(get_economics))
         .route("/simulation/chaos", axum::routing::post(set_chaos))
         .route("/simulation/load", axum::routing::post(run_load))
+        .route("/simulation/phase", axum::routing::post(set_phase))
         .route("/ws", get(ws_handler))
         .layer(CorsLayer::permissive())
         .with_state(node.clone());
@@ -528,4 +552,14 @@ async fn run_load(
     });
     
     axum::http::StatusCode::ACCEPTED
+}
+
+async fn set_phase(
+    State(node): State<Arc<IngestionNode>>,
+    Json(phase): Json<DeploymentPhase>,
+) -> impl IntoResponse {
+    let mut p = node.phase.write().await;
+    *p = phase;
+    log::info!("Deployment Phase Updated to: {:?}", phase);
+    axum::http::StatusCode::OK
 }
