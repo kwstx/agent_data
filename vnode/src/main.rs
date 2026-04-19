@@ -20,6 +20,9 @@ use axum::{
 use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 
+mod economics;
+use economics::{StakingManager, NodeStats, SlashingEvent};
+
 // --- Cryptographic & Merkle Setup ---
 
 #[derive(Clone)]
@@ -59,6 +62,7 @@ pub struct QuorumSnapshot {
     pub merkle_root: String,
     pub values: BTreeMap<String, f64>, // Aggregated values (e.g. medians)
     pub signatures: Vec<String>,      // Evidence of node agreement
+    pub slashing_events: Vec<SlashingEvent>,
 }
 
 pub type GlobalState = Arc<DashMap<String, StateValue>>;
@@ -118,6 +122,7 @@ struct IngestionNode {
     // Latest verified state
     latest_snapshot: Arc<tokio::sync::RwLock<Option<InternalSnapshot>>>,
     tx: broadcast::Sender<QuorumSnapshot>,
+    pub staking_manager: Arc<StakingManager>,
 }
 
 impl IngestionNode {
@@ -135,6 +140,7 @@ impl IngestionNode {
             peer_observations: Arc::new(DashMap::new()),
             latest_snapshot: Arc::new(tokio::sync::RwLock::new(None)),
             tx,
+            staking_manager: Arc::new(StakingManager::new(100.0)),
         }
     }
 
@@ -235,24 +241,54 @@ impl IngestionNode {
             }
 
             let mut aggregated_values = BTreeMap::new();
-            for (key, mut values) in value_map {
-                let median = Self::calculate_median(&mut values);
-                aggregated_values.insert(key, median);
+            for (key, values) in &value_map {
+                let mut v = values.clone();
+                let median = Self::calculate_median(&mut v);
+                aggregated_values.insert(key.clone(), median);
             }
 
             // 4. Construct Merkle Tree over aggregated state
             let (tree, key_to_index) = Self::build_merkle_tree(&aggregated_values);
             let root = hex::encode(tree.root().unwrap_or([0u8; 32]));
 
-            // 5. Produce Quorum Snapshot (Evidence of majority)
-            // In a real system, each node would sign the Merkle Root or the entire snapshot.
-            // For this demo, we'll sign the Merkle Root with the node's key.
+            // 5. Evaluate Node Performance and Check for Slashing
+            let mut slashing_events = Vec::new();
+            for (node_id, _values) in &value_map {
+                // If we have a consensus value (median) for this key
+                if let Some(&median) = aggregated_values.get(node_id) {
+                    for obs in &all_observations {
+                        if &obs.key == node_id {
+                            let deviation = (obs.value - median).abs() / median;
+                            let is_consistent = deviation < self.staking_manager.slashing_threshold;
+                            
+                            self.staking_manager.update_performance(&obs.node_id, is_consistent, 0).await;
+                            
+                            if !is_consistent {
+                                if let Some(event) = self.staking_manager.slash_node(
+                                    &obs.node_id, 
+                                    epoch, 
+                                    &format!("Value deviation: {:.2}%", deviation * 100.0),
+                                    0.05 // Slash 5% for malicious/incorrect data
+                                ).await {
+                                    slashing_events.push(event);
+                                    log::warn!("Node {} SLASHED for deviation: {:.2}%", obs.node_id, deviation * 100.0);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 6. Distribute Rewards
+            let rewards = self.staking_manager.calculate_rewards(1.0).await; // 1.0 units per epoch
+            self.staking_manager.distribute_rewards(rewards).await;
+
+            // 7. Produce Quorum Snapshot
             let message = format!("epoch:{}:root:{}", epoch, root);
             let signature = self.signing_key.sign(message.as_bytes());
             let node_signature = hex::encode(signature.to_bytes());
 
             let mut all_signatures = vec![node_signature];
-            // Mock peer signatures for the root (simulating 2 more nodes agreeing)
             all_signatures.push("peer_alpha_sig_placeholder".to_string());
             all_signatures.push("peer_beta_sig_placeholder".to_string());
 
@@ -261,6 +297,7 @@ impl IngestionNode {
                 merkle_root: root.clone(),
                 values: aggregated_values.clone(),
                 signatures: all_signatures,
+                slashing_events,
             };
 
             // Update shared state and broadcast
@@ -286,9 +323,14 @@ impl IngestionNode {
         let mut peers = Vec::new();
         let peer_ids = vec!["node_beta", "node_gamma"];
         
-        for pid in peer_ids {
-            let offset = (rand::random::<f64>() - 0.5) * 10.0;
-            // Simplified peer observation (not actually signing here for brevity in demo)
+        for (_i, pid) in peer_ids.iter().enumerate() {
+            let mut offset = (rand::random::<f64>() - 0.5) * 10.0;
+            
+            // Periodically inject "malicious" or "stale" data from node_gamma to demonstrate slashing
+            if *pid == "node_gamma" && rand::random::<f64>() < 0.2 {
+                offset = 100.0; // Significant deviation
+            }
+
             peers.push(SignedObservation {
                 node_id: pid.to_string(),
                 key: "ETH/USD".to_string(),
@@ -315,6 +357,12 @@ async fn main() -> Result<()> {
 
     // Consensus loop handles signing, median aggregation, and Merkle root calculation
     let node_loop = node.clone();
+
+    // Register initial nodes in the staking system
+    node.staking_manager.register_node("node_alpha", 1000.0).await.unwrap();
+    node.staking_manager.register_node("node_beta", 1000.0).await.unwrap();
+    node.staking_manager.register_node("node_gamma", 1000.0).await.unwrap();
+
     tokio::spawn(async move {
         if let Err(e) = node_loop.run_consensus_loop().await {
             log::error!("Consensus loop error: {}", e);
@@ -327,6 +375,7 @@ async fn main() -> Result<()> {
         .route("/state", get(get_all_state))
         .route("/state/:key", get(get_key_state))
         .route("/nodes", get(get_nodes))
+        .route("/economics", get(get_economics))
         .route("/ws", get(ws_handler))
         .layer(CorsLayer::permissive())
         .with_state(node);
@@ -418,4 +467,10 @@ async fn handle_socket(mut socket: WebSocket, node: Arc<IngestionNode>) {
 
 async fn get_nodes(State(node): State<Arc<IngestionNode>>) -> impl IntoResponse {
     Json(vec![node.public_key()]).into_response()
+}
+
+async fn get_economics(State(node): State<Arc<IngestionNode>>) -> impl IntoResponse {
+    let nodes = node.staking_manager.nodes.read().await;
+    let stats: Vec<NodeStats> = nodes.values().cloned().collect();
+    Json(stats).into_response()
 }
