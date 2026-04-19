@@ -73,9 +73,7 @@ pub struct QueryResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProofData {
     pub merkle_root: String,
-    pub proof_bytes: String,
-    pub index: usize,
-    pub total_leaves: usize,
+    pub proof_path: Vec<(String, bool)>, // (hash, is_left)
     pub signatures: Vec<String>,
 }
 
@@ -138,6 +136,10 @@ impl IngestionNode {
             latest_snapshot: Arc::new(tokio::sync::RwLock::new(None)),
             tx,
         }
+    }
+
+    fn public_key(&self) -> String {
+        hex::encode(VerifyingKey::from(&self.signing_key).to_bytes())
     }
 
     async fn run_source(&self, source: Arc<dyn DataSource>) -> Result<()> {
@@ -243,11 +245,22 @@ impl IngestionNode {
             let root = hex::encode(tree.root().unwrap_or([0u8; 32]));
 
             // 5. Produce Quorum Snapshot (Evidence of majority)
+            // In a real system, each node would sign the Merkle Root or the entire snapshot.
+            // For this demo, we'll sign the Merkle Root with the node's key.
+            let message = format!("epoch:{}:root:{}", epoch, root);
+            let signature = self.signing_key.sign(message.as_bytes());
+            let node_signature = hex::encode(signature.to_bytes());
+
+            let mut all_signatures = vec![node_signature];
+            // Mock peer signatures for the root (simulating 2 more nodes agreeing)
+            all_signatures.push("peer_alpha_sig_placeholder".to_string());
+            all_signatures.push("peer_beta_sig_placeholder".to_string());
+
             let snapshot = QuorumSnapshot {
                 epoch,
                 merkle_root: root.clone(),
                 values: aggregated_values.clone(),
-                signatures: all_observations.iter().map(|o| o.signature.clone()).collect(),
+                signatures: all_signatures,
             };
 
             // Update shared state and broadcast
@@ -313,6 +326,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/state", get(get_all_state))
         .route("/state/:key", get(get_key_state))
+        .route("/nodes", get(get_nodes))
         .route("/ws", get(ws_handler))
         .layer(CorsLayer::permissive())
         .with_state(node);
@@ -344,16 +358,24 @@ async fn get_key_state(
         if let Some(&index) = internal.key_to_index.get(&key) {
             let value = *internal.snapshot.values.get(&key).unwrap();
             let proof = internal.tree.proof(&[index]);
-            let proof_bytes = hex::encode(proof.to_bytes());
+            let hashes = proof.proof_hashes();
+            
+            let mut proof_path = Vec::new();
+            let mut curr_index = index;
+            for h in hashes {
+                // If index is even, sibling is at index + 1 (right)
+                // If index is odd, sibling is at index - 1 (left)
+                let is_left = curr_index % 2 == 1;
+                proof_path.push((hex::encode(h), is_left));
+                curr_index /= 2;
+            }
             
             Json(QueryResponse {
                 key,
                 value,
                 proof: ProofData {
                     merkle_root: internal.snapshot.merkle_root.clone(),
-                    proof_bytes,
-                    index,
-                    total_leaves: internal.snapshot.values.len(),
+                    proof_path,
                     signatures: internal.snapshot.signatures.clone(),
                 },
             }).into_response()
@@ -392,4 +414,8 @@ async fn handle_socket(mut socket: WebSocket, node: Arc<IngestionNode>) {
             break;
         }
     }
+}
+
+async fn get_nodes(State(node): State<Arc<IngestionNode>>) -> impl IntoResponse {
+    Json(vec![node.public_key()]).into_response()
 }
