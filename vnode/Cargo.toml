@@ -1,0 +1,23 @@
+[package]
+name = "vnode"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dashmap = "6.0"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
+reqwest = { version = "0.11", features = ["json"] }
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.11"
+rand = "0.8"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+hex = "0.4"
+async-trait = "0.1"
+sha2 = "0.10"
+rs_merkle = "1.4"
