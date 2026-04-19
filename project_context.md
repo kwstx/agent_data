@@ -88,3 +88,15 @@ The access layer is implemented as a high-performance Rust service using `axum`.
   }
 }
 ```
+
+## Reliability & Resilience Layer (Implemented)
+To ensure system integrity under stress, we have implemented a continuous testing and adversarial simulation framework:
+
+- **Chaos Engineering & Fault Injection**:
+  - **Latency Simulation**: Nodes can be configured to simulate network latency variance, injecting delays into data ingestion and consensus propagation.
+  - **Data Corruption**: Adversarial nodes can inject corrupted or outlier data to test the robustness of the quorum mechanism and deterministic aggregation (slashing).
+- **Stress Testing (Load Generation)**:
+  - **High-Frequency Simulation**: Capable of simulating thousands of concurrent agent requests to measure end-to-end latency from ingestion to verified state output.
+  - **Throughput Analysis**: Real-time measurement of request per second (RPS) and latency percentiles to identify bottlenecks.
+- **Dynamic Adversarial Controls**: 
+  - Exposed via `/simulation/chaos` and `/simulation/load` endpoints for real-time adjustments and performance profiling without restarting the network.

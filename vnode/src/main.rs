@@ -1,9 +1,7 @@
-use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::time::{self, Duration};
 use chrono::{Utc, DateTime};
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use ed25519_dalek::{SigningKey, Signer, VerifyingKey};
 use rand::rngs::OsRng;
 use async_trait::async_trait;
@@ -21,7 +19,10 @@ use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 
 mod economics;
+mod simulation;
+
 use economics::{StakingManager, NodeStats, SlashingEvent};
+use simulation::{AdversarialSource, ChaosGovernor, StressTester};
 
 // --- Cryptographic & Merkle Setup ---
 
@@ -123,6 +124,7 @@ struct IngestionNode {
     latest_snapshot: Arc<tokio::sync::RwLock<Option<InternalSnapshot>>>,
     tx: broadcast::Sender<QuorumSnapshot>,
     pub staking_manager: Arc<StakingManager>,
+    pub chaos: Arc<ChaosGovernor>,
 }
 
 impl IngestionNode {
@@ -141,6 +143,7 @@ impl IngestionNode {
             latest_snapshot: Arc::new(tokio::sync::RwLock::new(None)),
             tx,
             staking_manager: Arc::new(StakingManager::new(100.0)),
+            chaos: Arc::new(ChaosGovernor::new()),
         }
     }
 
@@ -376,9 +379,21 @@ async fn main() -> Result<()> {
         .route("/state/:key", get(get_key_state))
         .route("/nodes", get(get_nodes))
         .route("/economics", get(get_economics))
+        .route("/simulation/chaos", axum::routing::post(set_chaos))
+        .route("/simulation/load", axum::routing::post(run_load))
         .route("/ws", get(ws_handler))
         .layer(CorsLayer::permissive())
-        .with_state(node);
+        .with_state(node.clone());
+
+    // Initialize StressTester
+    let _stress_tester = Arc::new(StressTester::new());
+    
+    // Setup Ingestion with Adversarial Source
+    let adv_source = Arc::new(AdversarialSource {
+        base_name: "Feed_Adversarial".to_string(),
+        chaos: node.chaos.clone(),
+    });
+    node.run_source(adv_source).await?;
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
     log::info!("API Server listening on http://localhost:3000");
@@ -473,4 +488,44 @@ async fn get_economics(State(node): State<Arc<IngestionNode>>) -> impl IntoRespo
     let nodes = node.staking_manager.nodes.read().await;
     let stats: Vec<NodeStats> = nodes.values().cloned().collect();
     Json(stats).into_response()
+}
+
+#[derive(Deserialize)]
+struct ChaosRequest {
+    latency_min: u64,
+    latency_max: u64,
+    corruption_rate: f64,
+}
+
+async fn set_chaos(
+    State(node): State<Arc<IngestionNode>>,
+    Json(payload): Json<ChaosRequest>,
+) -> impl IntoResponse {
+    let mut lat = node.chaos.latency_range.write().await;
+    *lat = (payload.latency_min, payload.latency_max);
+    let mut corr = node.chaos.corruption_rate.write().await;
+    *corr = payload.corruption_rate;
+    
+    log::info!("Chaos Parameters Updated: Latency {}ms-{}ms, Corruption {}%", 
+        payload.latency_min, payload.latency_max, payload.corruption_rate * 100.0);
+    
+    axum::http::StatusCode::OK
+}
+
+#[derive(Deserialize)]
+struct LoadRequest {
+    agents: usize,
+    duration_secs: u64,
+}
+
+async fn run_load(
+    State(_node): State<Arc<IngestionNode>>,
+    Json(payload): Json<LoadRequest>,
+) -> impl IntoResponse {
+    let stress_tester = StressTester::new();
+    tokio::spawn(async move {
+        stress_tester.run_load_test("http://localhost:3000", payload.agents, payload.duration_secs).await;
+    });
+    
+    axum::http::StatusCode::ACCEPTED
 }
