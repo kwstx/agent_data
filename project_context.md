@@ -63,3 +63,28 @@ graph TD
     end
 ```
 
+### Unified API System (Implemented)
+The access layer is implemented as a high-performance Rust service using `axum`. It provides:
+
+- **RESTful State Queries**:
+  - `GET /state`: Returns the full latest verified quorum snapshot including Merkle root and node signatures.
+  - `GET /state/:key`: Returns a specific asset value along with a Merkle inclusion proof for independent verification by the agent.
+- **Real-Time WebSocket Streaming**:
+  - `WS /ws`: A persistent channel that broadcasts new `QuorumSnapshot` objects every time a consensus epoch is reached.
+- **Cryptographic Verification**:
+  - Each response includes the `proof` field, containing the Merkle proof and node signatures, allowing agents to verify the data against the on-chain anchor or known node public keys.
+
+### Standardized Schema Example
+```json
+{
+  "key": "ETH/USD",
+  "value": 2510.42,
+  "proof": {
+    "merkle_root": "a1b2...",
+    "proof_bytes": "f3e1...",
+    "index": 0,
+    "total_leaves": 1,
+    "signatures": ["sig1...", "sig2..."]
+  }
+}
+```

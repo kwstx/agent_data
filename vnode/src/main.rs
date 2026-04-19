@@ -4,12 +4,21 @@ use std::sync::Arc;
 use tokio::time::{self, Duration};
 use chrono::{Utc, DateTime};
 use anyhow::{Result, anyhow};
-use ed25519_dalek::{SigningKey, Signer, VerifyingKey, Signature};
+use ed25519_dalek::{SigningKey, Signer, VerifyingKey};
 use rand::rngs::OsRng;
 use async_trait::async_trait;
 use sha2::{Sha256, Digest};
 use rs_merkle::{MerkleTree, Hasher};
 use std::collections::BTreeMap;
+use axum::{
+    extract::{ws::{WebSocket, Message, WebSocketUpgrade}, Path, State},
+    response::IntoResponse,
+    routing::get,
+    Router,
+    Json,
+};
+use tokio::sync::broadcast;
+use tower_http::cors::CorsLayer;
 
 // --- Cryptographic & Merkle Setup ---
 
@@ -54,6 +63,28 @@ pub struct QuorumSnapshot {
 
 pub type GlobalState = Arc<DashMap<String, StateValue>>;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryResponse {
+    pub key: String,
+    pub value: f64,
+    pub proof: ProofData,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofData {
+    pub merkle_root: String,
+    pub proof_bytes: String,
+    pub index: usize,
+    pub total_leaves: usize,
+    pub signatures: Vec<String>,
+}
+
+pub struct InternalSnapshot {
+    pub snapshot: QuorumSnapshot,
+    pub tree: MerkleTree<Sha256Hasher>,
+    pub key_to_index: BTreeMap<String, usize>,
+}
+
 // --- Source Abstraction ---
 
 #[async_trait]
@@ -86,6 +117,9 @@ struct IngestionNode {
     interval_ms: u64,
     // Simulator for peer observations
     peer_observations: Arc<DashMap<u64, Vec<SignedObservation>>>,
+    // Latest verified state
+    latest_snapshot: Arc<tokio::sync::RwLock<Option<InternalSnapshot>>>,
+    tx: broadcast::Sender<QuorumSnapshot>,
 }
 
 impl IngestionNode {
@@ -93,12 +127,16 @@ impl IngestionNode {
         let mut csprng = OsRng;
         let signing_key = SigningKey::generate(&mut csprng);
         
+        let (tx, _) = broadcast::channel(100);
+        
         Self {
             id: id.to_string(),
             state: Arc::new(DashMap::new()),
             signing_key,
             interval_ms,
             peer_observations: Arc::new(DashMap::new()),
+            latest_snapshot: Arc::new(tokio::sync::RwLock::new(None)),
+            tx,
         }
     }
 
@@ -152,16 +190,17 @@ impl IngestionNode {
     }
 
     /// Performs Merkle tree construction over aggregated state
-    fn build_merkle_root(values: &BTreeMap<String, f64>) -> String {
-        let leaves: Vec<[u8; 32]> = values.iter()
-            .map(|(k, v)| {
+    fn build_merkle_tree(values: &BTreeMap<String, f64>) -> (MerkleTree<Sha256Hasher>, BTreeMap<String, usize>) {
+        let mut key_to_index = BTreeMap::new();
+        let leaves: Vec<[u8; 32]> = values.iter().enumerate()
+            .map(|(i, (k, v))| {
+                key_to_index.insert(k.clone(), i);
                 let leaf_data = format!("{}:{}", k, v);
                 Sha256Hasher::hash(leaf_data.as_bytes())
             })
             .collect();
         
-        let tree = MerkleTree::<Sha256Hasher>::from_leaves(&leaves);
-        hex::encode(tree.root().unwrap_or([0u8; 32]))
+        (MerkleTree::<Sha256Hasher>::from_leaves(&leaves), key_to_index)
     }
 
     async fn run_consensus_loop(&self) -> Result<()> {
@@ -200,16 +239,27 @@ impl IngestionNode {
             }
 
             // 4. Construct Merkle Tree over aggregated state
-            let root = Self::build_merkle_root(&aggregated_values);
+            let (tree, key_to_index) = Self::build_merkle_tree(&aggregated_values);
+            let root = hex::encode(tree.root().unwrap_or([0u8; 32]));
 
             // 5. Produce Quorum Snapshot (Evidence of majority)
-            // In a real system, we'd verify multiple node signatures for the same root
             let snapshot = QuorumSnapshot {
                 epoch,
                 merkle_root: root.clone(),
                 values: aggregated_values.clone(),
                 signatures: all_observations.iter().map(|o| o.signature.clone()).collect(),
             };
+
+            // Update shared state and broadcast
+            {
+                let mut lock = self.latest_snapshot.write().await;
+                *lock = Some(InternalSnapshot {
+                    snapshot: snapshot.clone(),
+                    tree,
+                    key_to_index,
+                });
+            }
+            let _ = self.tx.send(snapshot.clone());
 
             log::info!("Quorum Achieved for Epoch {}: Root={}", epoch, root);
             for (k, v) in &snapshot.values {
@@ -251,7 +301,95 @@ async fn main() -> Result<()> {
     node.run_source(source1).await?;
 
     // Consensus loop handles signing, median aggregation, and Merkle root calculation
-    node.run_consensus_loop().await?;
+    let node_loop = node.clone();
+    tokio::spawn(async move {
+        if let Err(e) = node_loop.run_consensus_loop().await {
+            log::error!("Consensus loop error: {}", e);
+        }
+    });
+
+    // --- API Server ---
+
+    let app = Router::new()
+        .route("/state", get(get_all_state))
+        .route("/state/:key", get(get_key_state))
+        .route("/ws", get(ws_handler))
+        .layer(CorsLayer::permissive())
+        .with_state(node);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    log::info!("API Server listening on http://localhost:3000");
+    axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+// --- API Handlers ---
+
+async fn get_all_state(State(node): State<Arc<IngestionNode>>) -> impl IntoResponse {
+    let lock = node.latest_snapshot.read().await;
+    if let Some(internal) = &*lock {
+        Json(internal.snapshot.clone()).into_response()
+    } else {
+        (axum::http::StatusCode::NOT_FOUND, "No snapshot available").into_response()
+    }
+}
+
+async fn get_key_state(
+    State(node): State<Arc<IngestionNode>>,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
+    let lock = node.latest_snapshot.read().await;
+    if let Some(internal) = &*lock {
+        if let Some(&index) = internal.key_to_index.get(&key) {
+            let value = *internal.snapshot.values.get(&key).unwrap();
+            let proof = internal.tree.proof(&[index]);
+            let proof_bytes = hex::encode(proof.to_bytes());
+            
+            Json(QueryResponse {
+                key,
+                value,
+                proof: ProofData {
+                    merkle_root: internal.snapshot.merkle_root.clone(),
+                    proof_bytes,
+                    index,
+                    total_leaves: internal.snapshot.values.len(),
+                    signatures: internal.snapshot.signatures.clone(),
+                },
+            }).into_response()
+        } else {
+            (axum::http::StatusCode::NOT_FOUND, "Key not found in state").into_response()
+        }
+    } else {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "No snapshot available").into_response()
+    }
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(node): State<Arc<IngestionNode>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_socket(socket, node))
+}
+
+async fn handle_socket(mut socket: WebSocket, node: Arc<IngestionNode>) {
+    let mut rx = node.tx.subscribe();
+    
+    // Send latest state immediately if available
+    {
+        let lock = node.latest_snapshot.read().await;
+        if let Some(internal) = &*lock {
+            let msg = serde_json::to_string(&internal.snapshot).unwrap();
+            if socket.send(Message::Text(msg)).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    while let Ok(snapshot) = rx.recv().await {
+        let msg = serde_json::to_string(&snapshot).unwrap();
+        if socket.send(Message::Text(msg)).await.is_err() {
+            break;
+        }
+    }
 }
